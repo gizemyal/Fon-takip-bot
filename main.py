@@ -10,11 +10,18 @@ FON_KODLARI = ["TLY", "PBR"]
 def get_fund_data(fon_kodu):
     url = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
     today = datetime.now()
-    start_date = (today - timedelta(days=7)).strftime("%d.%m.%Y")
+    
+    # Hafta sonu veya sabah erken saatler için 10 günlük geniş bir aralık tarıyoruz
+    start_date = (today - timedelta(days=10)).strftime("%d.%m.%Y")
     end_date = today.strftime("%d.%m.%Y")
 
+    session = requests.Session()
+    
+    # TEFAS engeline takılmamak için gerekli tarayıcı başlıkları
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
         "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://www.tefas.gov.tr",
         "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx"
@@ -28,29 +35,36 @@ def get_fund_data(fon_kodu):
     }
 
     try:
-        res = requests.post(url, data=payload, headers=headers, timeout=10)
-        data = res.json().get("data", [])
-        if len(data) >= 1:
-            latest = data[0]
-            price = float(latest.get("BirimFiyat", 0))
-            change_str = ""
-            
-            if len(data) >= 2:
-                prev_price = float(data[1].get("BirimFiyat", 0))
-                if prev_price > 0:
-                    change = ((price - prev_price) / prev_price) * 100
-                    emoji = "🟢" if change >= 0 else "🔴"
-                    sign = "+" if change >= 0 else ""
-                    change_str = f" ({sign}%{change:.2f} {emoji})"
-                    
-            return price, change_str
+        # Önce anasayfayı ziyaret edip cookie alıyoruz
+        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", headers=headers, timeout=10)
+        
+        # Ardından API isteğini atıyoruz
+        res = session.post(url, data=payload, headers=headers, timeout=10)
+        
+        if res.status_code == 200:
+            data = res.json().get("data", [])
+            if len(data) >= 1:
+                latest = data[0]
+                price = float(latest.get("BirimFiyat", 0))
+                change_str = ""
+                
+                if len(data) >= 2:
+                    prev_price = float(data[1].get("BirimFiyat", 0))
+                    if prev_price > 0:
+                        change = ((price - prev_price) / prev_price) * 100
+                        emoji = "🟢" if change >= 0 else "🔴"
+                        sign = "+" if change >= 0 else ""
+                        change_str = f" ({sign}%{change:.2f} {emoji})"
+                        
+                return price, change_str
     except Exception as e:
         print(f"Hata ({fon_kodu}): {e}")
+        
     return None, ""
 
 def send_telegram_message(message):
     if not BOT_TOKEN or not CHAT_ID:
-        print("Bot Token veya Chat ID bulunamadı!")
+        print("Bot Token veya Chat ID eksik!")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
