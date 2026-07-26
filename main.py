@@ -1,43 +1,42 @@
 import os
-import ssl
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.ssl_ import create_urllib3_context
-import urllib3
+import sys
+import subprocess
+import re
 from datetime import datetime, timedelta
 import pytz
-import re
 
-# SSL uyarılarını kapatıyoruz
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Gerekli kütüphaneyi GitHub sunucusuna otomatik yüklüyoruz
+def install_package(package):
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--quiet"])
+    except Exception as e:
+        print(f"Paket yükleme hatası ({package}): {e}")
+
+try:
+    import cloudscraper
+except ImportError:
+    install_package("cloudscraper")
+    import cloudscraper
+
+try:
+    import requests
+except ImportError:
+    install_package("requests")
+    import requests
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 FON_KODLARI = ["TLY", "PBR"]
 
-class LegacySSLAdapter(HTTPAdapter):
-    def init_poolmanager(self, *args, **kwargs):
-        ctx = create_urllib3_context()
-        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        kwargs['ssl_context'] = ctx
-        return super().init_poolmanager(*args, **kwargs)
-
-def get_fund_data(fon_kodu):
-    session = requests.Session()
-    session.mount('https://', LegacySSLAdapter())
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
-    }
-    session.headers.update(headers)
-
-    # --- YÖNTEM 1: TEFAS API (Çerez Oturumu ile) ---
+def get_data_via_cloudscraper(fon_kodu):
+    """Yöntem 1: TEFAS Cloudflare korumasını aşarak veriyi çeker"""
     try:
-        # 1. Adım: ASP.NET Session Cookie almak için TarihselVeriler sayfasını ziyaret et
-        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", timeout=10, verify=False)
+        scraper = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
+        )
+        
+        # Oturum oluşturma
+        scraper.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", timeout=10)
         
         today = datetime.now()
         start_date = (today - timedelta(days=15)).strftime("%d.%m.%Y")
@@ -50,15 +49,13 @@ def get_fund_data(fon_kodu):
             "fonkod": fon_kodu
         }
         
-        api_headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        headers = {
             "X-Requested-With": "XMLHttpRequest",
             "Origin": "https://www.tefas.gov.tr",
             "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx"
         }
         
-        res = session.post("https://www.tefas.gov.tr/api/DB/BindHistoryInfo", data=payload, headers=api_headers, timeout=10, verify=False)
+        res = scraper.post("https://www.tefas.gov.tr/api/DB/BindHistoryInfo", data=payload, headers=headers, timeout=12)
         
         if res.status_code == 200:
             data = res.json().get("data", [])
@@ -75,42 +72,37 @@ def get_fund_data(fon_kodu):
                         change_str = f" ({sign}%{change:.2f} {emoji})"
                 return price, change_str
     except Exception as e:
-        print(f"TEFAS API Hatası ({fon_kodu}): {e}")
+        print(f"Cloudscraper Hatası ({fon_kodu}): {e}")
+    return None, ""
 
-    # --- YÖNTEM 2: TEFAS Web Sayfası Parse ---
+def get_data_via_isyatirim(fon_kodu):
+    """Yöntem 2: İş Yatırım yedek kaynağından fon verisini çeker"""
     try:
-        web_res = session.get(f"https://www.tefas.gov.tr/FonAnaliz.aspx?FonKod={fon_kodu}", timeout=10, verify=False)
-        if web_res.status_code == 200:
-            price_match = re.search(r'MainContent_lblFiyat"[^>]*>([\d,\.]+)<', web_res.text) or \
-                          re.search(r'Son Fiyat \(TL\)[\s\S]*?<span>([\d,\.]+)</span>', web_res.text)
-            if price_match:
-                price = float(price_match.group(1).replace(",", "."))
-                change_match = re.search(r'MainContent_lblGunlukGetiri"[^>]*>([%+\-\d,\.]+)<', web_res.text)
-                change_str = ""
-                if change_match:
-                    g_str = change_match.group(1).strip()
-                    emoji = "🔴" if "-" in g_str else "🟢"
-                    change_str = f" ({g_str} {emoji})"
-                return price, change_str
-    except Exception as e:
-        print(f"TEFAS Web Hatası ({fon_kodu}): {e}")
-
-    # --- YÖNTEM 3: Bigpara / Finans Yedek Kaynağı ---
-    try:
-        bp_res = session.get(f"https://bigpara.hurriyet.com.tr/borsa/fon-detay/{fon_kodu.upper()}/", timeout=10, verify=False)
-        if bp_res.status_code == 200:
-            price_match = re.search(r'class="[^"]*value[^"]*"[^>]*>([\d,\.]+)<', bp_res.text)
+        url = f"https://www.isyatirim.com.tr/tr-tr/analiz/fon/Sayfalar/default.aspx"
+        scraper = cloudscraper.create_scraper()
+        res = scraper.get(f"https://www.isyatirim.com.tr/tr-tr/analiz/fon/Sayfalar/fon-detay.aspx?fonkod={fon_kodu}", timeout=10)
+        
+        if res.status_code == 200:
+            # Fiyat arama
+            price_match = re.search(r'Fiyat\s*\(TL\)[\s\S]*?<td>([\d,\.]+)</td>', res.text) or \
+                          re.search(r'class="value"[^>]*>([\d,\.]+)<', res.text)
             if price_match:
                 price = float(price_match.group(1).replace(",", ".").strip())
-                change_match = re.search(r'class="[^"]*change[^"]*"[^>]*>([%+\-\d,\.]+)<', bp_res.text)
-                change_str = ""
-                if change_match:
-                    c_str = change_match.group(1).strip()
-                    emoji = "🔴" if "-" in c_str else "🟢"
-                    change_str = f" ({c_str} {emoji})"
-                return price, change_str
+                return price, ""
     except Exception as e:
-        print(f"Yedek Kaynak Hatası ({fon_kodu}): {e}")
+        print(f"İş Yatırım Hatası ({fon_kodu}): {e}")
+    return None, ""
+
+def get_fund_data(fon_kodu):
+    # 1. Deneme: Cloudscraper ile TEFAS
+    price, change = get_data_via_cloudscraper(fon_kodu)
+    if price is not None:
+        return price, change
+        
+    # 2. Deneme: İş Yatırım (Yedek)
+    price, change = get_data_via_isyatirim(fon_kodu)
+    if price is not None:
+        return price, change
 
     return None, ""
 
