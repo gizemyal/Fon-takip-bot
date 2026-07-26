@@ -1,27 +1,45 @@
 import os
+import ssl
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
+import urllib3
 from datetime import datetime, timedelta
 import pytz
+
+# SSL uyarılarını kapatıyoruz
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 FON_KODLARI = ["TLY", "PBR"]
 
+# GitHub (Linux) sunucularında TEFAS SSL sertifika engeline takılmamak için Özel SSL Adaptörü
+class LegacySSLAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        kwargs['ssl_context'] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
 def get_fund_data(fon_kodu):
     url = "https://www.tefas.gov.tr/api/DB/BindHistoryInfo"
     today = datetime.now()
     
-    # Hafta sonu veya sabah erken saatler için 10 günlük geniş bir aralık tarıyoruz
-    start_date = (today - timedelta(days=10)).strftime("%d.%m.%Y")
+    # Hafta sonu ve resmi tatiller dahil son 15 günlük veriyi tarıyoruz
+    start_date = (today - timedelta(days=15)).strftime("%d.%m.%Y")
     end_date = today.strftime("%d.%m.%Y")
 
     session = requests.Session()
+    session.mount('https://', LegacySSLAdapter())
     
-    # TEFAS engeline takılmamak için gerekli tarayıcı başlıkları
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://www.tefas.gov.tr",
         "Referer": "https://www.tefas.gov.tr/TarihselVeriler.aspx"
@@ -35,15 +53,11 @@ def get_fund_data(fon_kodu):
     }
 
     try:
-        # Önce anasayfayı ziyaret edip cookie alıyoruz
-        session.get("https://www.tefas.gov.tr/TarihselVeriler.aspx", headers=headers, timeout=10)
-        
-        # Ardından API isteğini atıyoruz
-        res = session.post(url, data=payload, headers=headers, timeout=10)
+        res = session.post(url, data=payload, headers=headers, timeout=15, verify=False)
         
         if res.status_code == 200:
             data = res.json().get("data", [])
-            if len(data) >= 1:
+            if data and len(data) >= 1:
                 latest = data[0]
                 price = float(latest.get("BirimFiyat", 0))
                 change_str = ""
